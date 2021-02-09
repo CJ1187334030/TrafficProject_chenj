@@ -8,8 +8,9 @@ import com.atguigu.monitor_status_analysis.bean.{MonitorCameraInfo, MonitorFlowA
 import com.atguigu.monitor_status_analysis.jdbc.JDBCHelper
 import com.atguigu.monitor_status_analysis.utils.StringUtils
 import org.apache.spark.SparkConf
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{SaveMode, SparkSession}
 import org.apache.spark.util.AccumulatorV2
 
 import scala.collection.mutable
@@ -17,14 +18,12 @@ import scala.collection.mutable
 case class TaskParam(startDate:String,endDate:String,topNum:String,areaName:String)
 case class OriginalRDD(flowAction:RDD[MonitorFlowAction],cameraInfo:RDD[MonitorCameraInfo])
 
-
-
 case class MysqlMonitotStatus (task_id:Int, task_name:String, create_time:String, start_time:String, finish_time:String,
                                task_type:String, task_status:String, task_param:String
                               )
 
-case class MonitorState(taskId:Int,abnormal_monitor_count:Int,normal_camera_count:Int
-                        ,abnormal_camera_count:Int,abnormal_monitor_camera_infos:String)
+case class MonitorState(taskId:Long,noraml_monitor_count:Long,normal_camera_count:Long,abnormal_monitor_count:Long
+                        ,abnormal_camera_count:Long,abnormal_monitor_camera_infos:String)
 
 
 
@@ -47,27 +46,25 @@ object MonitorStatusAnazysis {
     //cameraInfo 按照monitor分组，所有camera拿出来拼接，做contain判断
     // (0005,"33745,33745,33745,33745")
     val groupByCameraInfo: RDD[(String, Iterable[MonitorCameraInfo])] = cameraInfo.map(x => (x.monitor_id, x)).groupByKey()
-    //获取(0005,33745|33745|33745|33745)
-    val monitor2cameraInfo: RDD[(String, String)] = getgroupByCameraInfo(groupByCameraInfo)
-
 
     val groupByMonitorFlow: RDD[(String, Iterable[MonitorFlowAction])] = flowAction.map(x => (x.monitor_id, x)).groupByKey()
 
-    //getJoinData
-    val filterDate: RDD[String] = getFinalDate(groupByCameraInfo, groupByMonitorFlow, myAccumulatorV)
+    //需求一： 0	9	47073	60	0000:37990,60679,75084,51053,34497,03604,93447,07714~~~xxx
+    val unit: RDD[MonitorState] = getFinalDate(groupByCameraInfo, groupByMonitorFlow, myAccumulatorV,spark)
 
-    filterDate.foreach(println(_))
+//    monitorState.toString().foreach(print(_))
 
     //    myAccumulatorV.value.foreach(println(_))
 
   }
 
   def getFinalDate(groupByCameraInfo: RDD[(String, Iterable[MonitorCameraInfo])], groupByMonitorFlow: RDD[(String, Iterable[MonitorFlowAction])],
-                   myAccumulatorV: MyAccumulatorV2) = {
+                   myAccumulatorV: MyAccumulatorV2,spark: SparkSession) = {
 
-    val mid2FlowCid: RDD[(String, String)] = groupByMonitorFlow.map {
+    //获取实际mid2cid(0005,33745|33745|33745|33745)
+    val ActionFloMid2Cid: RDD[(String, String)] = groupByMonitorFlow.map {
 
-      case (mid, iter) => {
+      case (mid, iter) =>
 
         val buffer = new StringBuffer("")
 
@@ -79,16 +76,14 @@ object MonitorStatusAnazysis {
 
         (mid, str)
 
-      }
     }
 
-    //拿出异常的 (sid，camera|camera)
-    //(0004,50934|21038|30782|90551|28599|88785|81632)
-    val mid2ErrorCid: RDD[(String, String)] = mid2FlowCid.join(groupByCameraInfo).map {
+    //拿出异常的 (mid，cid1|cid2)
+    //逻辑=》拼接实际mid2cid 判断包不包含实际的每一个cid
+    //output：(0004,50934|21038|30782|90551|28599|88785|81632)
+    val mid2ErrorCids: RDD[(String, String)] = ActionFloMid2Cid.join(groupByCameraInfo).map {
 
-      //val tuples = new util.ArrayList[(String,String)]()
-
-      case (mid, (actualCid, iter)) => {
+      case (mid, (actualCid, iter)) =>
 
         val buffer = new StringBuffer("")
 
@@ -101,71 +96,53 @@ object MonitorStatusAnazysis {
         val str: String = StringUtils.trimComma(buffer.toString).replaceAll(",", "\\|")
         (mid, str)
 
-      }
     }
 
 
-    //异常mid总数，cid总数，合并
-    val errorMidCount: Long = mid2ErrorCid.count()
+    //获取所有mid数量
+    val allMid: Long = groupByCameraInfo.count()
+    //异常mid数量
+    val errorMidCount: Long = mid2ErrorCids.count()
+    //正常mid数量
+    val healthMid: Long = allMid - errorMidCount
 
-    val errorCidCount: Long = mid2ErrorCid.map(x => (x._2))
-      .flatMap(_.split("\\|")).count()
-
-    val buffer: StringBuffer = new StringBuffer("")
-
-    val value: RDD[String] = mid2ErrorCid.map {
-      case (mid, cids) =>
-
-        val info: String = mid + cids
-        buffer.append(info + "~~~").toString
-    }
-
-    //正常mid总数，cid总数
-    val healMidCount: Long = groupByCameraInfo.count()
-
-    var healCidCount = 0L
-
-    val value1: RDD[Long] = groupByCameraInfo.map {
-
-      case (mid, iter) => {
-
-        val size: Int = iter.size
-
-        healCidCount += size
-
-        healCidCount
-      }
-    }
-
-
-    value
-
-  }
-
-
-  def getgroupByCameraInfo(groupByCameraInfo: RDD[(String, Iterable[MonitorCameraInfo])]) = {
-
+    //获取所有cid数量
     groupByCameraInfo.map {
-
-      case (mid, iter) => {
-
-        val monitorId: String = mid
-        val cameraIdIter: Iterable[MonitorCameraInfo] = iter
-
-        val stringBuffer = new StringBuffer("")
-
-        for (elem <- cameraIdIter) {
-          stringBuffer.append(elem.camera_id).append(",")
+      case (mid, cids) =>
+        for (elem <- cids) {
+          myAccumulatorV.add(elem.toString)
         }
+    }.count()
 
-        val cameraIdNoComma: String = StringUtils.trimComma(stringBuffer.toString)
-        val cameraIdNoComma2: String = cameraIdNoComma.replaceAll(",", "|")
+//    异常cid数量
+    val errorCidCount: Long = mid2ErrorCids.map(x => (x._2))
+      .flatMap(_.split("\\|")).count()
+//    正常cid数量
+    val healthCid: Long = myAccumulatorV.value.size() - errorCidCount
 
-        (monitorId, cameraIdNoComma2)
 
-      }
-    }
+    //rdd转list用collect
+    val allinfo: String = mid2ErrorCids.map {
+      case (a, b) =>
+        a + ":" + b
+    }.collect().mkString("~~~~")
+
+    val monitorStateRDD: RDD[MonitorState] = spark.sparkContext.makeRDD(List(MonitorState(1, healthMid, healthCid, errorMidCount, errorCidCount, allinfo)))
+
+    import spark.implicits._
+    monitorStateRDD.toDF().write
+      .format("jdbc")
+      .option("url","jdbc:mysql://hdp101:3306/traffic")
+      .option("user","root")
+      .option("password","111111")
+      .option("dbtable","monitor_state")
+      .mode(SaveMode.Append)
+      .save()
+
+    monitorStateRDD
+
   }
+
 
 
   //获取原始RDD
@@ -210,39 +187,67 @@ object MonitorStatusAnazysis {
 }
 
 
+//使用
+class MyAccumulatorV2 extends AccumulatorV2[String,util.ArrayList[String]] {
 
-class MyAccumulatorV2 extends AccumulatorV2[String, mutable.HashMap[String, Int]] {
+  private val strings = new util.ArrayList[String]
 
-  val hashMap = new mutable.HashMap[String, Int]()
+  override def isZero: Boolean = strings.isEmpty
 
-  override def isZero: Boolean = hashMap.isEmpty
+  override def copy(): AccumulatorV2[String, util.ArrayList[String]] = new MyAccumulatorV2
 
-  override def copy(): AccumulatorV2[String, mutable.HashMap[String, Int]] = new MyAccumulatorV2
+  override def reset(): Unit = strings.clear()
 
-  override def reset(): Unit = hashMap.clear()
+  override def add(v: String): Unit = strings.add(v)
 
-  override def add(v: String): Unit = {
-    if (!hashMap.contains(v))
-      hashMap += (v -> 0)
+  override def merge(other: AccumulatorV2[String, util.ArrayList[String]]): Unit = strings addAll(other.value)
 
-    hashMap.update(v, hashMap(v) + 1)
-
-  }
-
-  override def merge(other: AccumulatorV2[String, mutable.HashMap[String, Int]]): Unit = {
-    other match {
-      case acc: MyAccumulatorV2 => {
-        acc.hashMap.foldLeft(this.hashMap) {
-          case (map, (k, v)) => map += (k -> (map.getOrElse(k, 0) + v))
-        }
-      }
-    }
-  }
-
-  override def value: mutable.HashMap[String, Int] = hashMap
-
+  override def value: util.ArrayList[String] = strings
 }
 
 
 
+//待续写
+class ErrorMyAccumulatorV2 extends AccumulatorV2[String,Long] {
 
+  var countt = 0L
+
+  override def isZero: Boolean = countt == 0
+
+  override def copy(): AccumulatorV2[String, Long] = new ErrorMyAccumulatorV2
+
+  override def reset(): Unit = countt = 0
+
+  override def add(v: String): Unit = countt += 1
+
+  override def merge(other: AccumulatorV2[String, Long]): Unit = {
+    countt + other.value
+  }
+
+  override def value: Long = countt
+}
+
+
+
+class WdAccumulatorV2 extends AccumulatorV2[String,util.ArrayList[String]]{
+
+  //确定返回结果，最终值
+  val arrayList = new util.ArrayList[String]()
+
+  override def isZero: Boolean = arrayList.isEmpty
+
+  override def copy(): AccumulatorV2[String, util.ArrayList[String]] = new WdAccumulatorV2
+
+  override def reset(): Unit = arrayList.clear()
+
+  override def add(v: String): Unit = {
+    if (v.contains("c"))
+      arrayList.add(v)
+  }
+
+  override def merge(other: AccumulatorV2[String, util.ArrayList[String]]): Unit = {
+    arrayList.addAll(other.value)
+  }
+
+  override def value: util.ArrayList[String] = arrayList
+}
