@@ -1,12 +1,12 @@
-package com.atguigu.traffic_project
+package com.atguigu.monitor_status_analysis
 
-import com.atguigu.traffic_project.bean.{MinitorCameraInfo, MonitorFlowAction}
+import com.atguigu.monitor_status_analysis.bean.{MonitorCameraInfo, MonitorFlowAction}
 import org.apache.spark.SparkConf
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 
 
-object MonitorFlowAnalysis {
+object MonitorStatusAnazysisWithSQL {
 
   def main(args: Array[String]): Unit = {
 
@@ -14,24 +14,13 @@ object MonitorFlowAnalysis {
     val spark: SparkSession = SparkSession.builder().enableHiveSupport().config(sc).getOrCreate()
     spark.conf.set("spark.sql.crossJoin.enabled", "true")
 
-    val sql = "select * from traffic.monitor_flow_action"
-    val sql1 = "select * from traffic.monitor_camera_info"
-
-    import spark.implicits._
-    val originFlowAction: RDD[MonitorFlowAction] = spark.sql(sql).as[MonitorFlowAction].rdd
-    val originCamareInfo: RDD[MinitorCameraInfo] = spark.sql(sql1).as[MinitorCameraInfo].rdd
-
-
-  }
-
-  //方式一：直接通过spark sql
-  def directSparkSql(spark: SparkSession): Unit ={
 
     val sql = "select * from traffic.monitor_flow_action"
     spark.sql(sql).createOrReplaceTempView("monitor_flow_action")
 
     val sql1 = "select * from traffic.monitor_camera_info"
     spark.sql(sql1).createOrReplaceTempView("monitor_camera_info")
+
 
     spark.sql(
       """
@@ -66,6 +55,5 @@ object MonitorFlowAnalysis {
         |tt
         |group by tt.mm
       """.stripMargin).show()
-
   }
 }
