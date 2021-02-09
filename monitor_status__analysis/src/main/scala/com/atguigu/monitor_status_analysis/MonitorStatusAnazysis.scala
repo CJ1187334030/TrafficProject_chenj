@@ -22,12 +22,17 @@ case class MysqlMonitotStatus (task_id:Int, task_name:String, create_time:String
                                task_type:String, task_status:String, task_param:String
                               )
 
+//需求一
 case class MonitorState(taskId:Long,noraml_monitor_count:Long,normal_camera_count:Long,abnormal_monitor_count:Long
                         ,abnormal_camera_count:Long,abnormal_monitor_camera_infos:String)
 
+//需求二(字段名称对应)：
+case class TopNMonitorFlowCount(task_id:Long,monitor_id:String,carCount:Long)
 
 
 object MonitorStatusAnazysis {
+
+
 
   def main(args: Array[String]): Unit = {
 
@@ -50,13 +55,54 @@ object MonitorStatusAnazysis {
     val groupByMonitorFlow: RDD[(String, Iterable[MonitorFlowAction])] = flowAction.map(x => (x.monitor_id, x)).groupByKey()
 
     //需求一： 0	9	47073	60	0000:37990,60679,75084,51053,34497,03604,93447,07714~~~xxx
-    val unit: RDD[MonitorState] = getFinalDate(groupByCameraInfo, groupByMonitorFlow, myAccumulatorV,spark)
+//    val monitorStateRDD: RDD[MonitorState] = getFinalDate(groupByCameraInfo, groupByMonitorFlow, myAccumulatorV,spark)
 
-//    monitorState.toString().foreach(print(_))
+    //需求二: 车流量最多的topN卡扣
+    val topNFlowMonitor: RDD[(String, Int)] = monitorCarFlowCount(spark,flowAction)
 
-    //    myAccumulatorV.value.foreach(println(_))
+    //需求三：topN卡扣下所有车辆详细信息
+    topNMonitorCardetail(spark,topNFlowMonitor,flowAction)
+
+
+
 
   }
+
+
+  def topNMonitorCardetail(spark: SparkSession, topNFlowMonitor: RDD[(String, Int)], flowAction: RDD[MonitorFlowAction]): Unit = {
+
+    val tuples: Array[(String, Int)] = topNFlowMonitor.take(3)
+
+    flowAction.map(x => (x.monitor_id,x)).groupByKey()
+
+
+  }
+
+
+  def monitorCarFlowCount(spark: SparkSession, flowAction: RDD[MonitorFlowAction]) = {
+
+    val mid2CarFlowCount: RDD[(String, Int)] = flowAction.map(x => (x.monitor_id,1)).reduceByKey(_+_).sortBy(_._2,false)
+//
+//    import spark.implicits._
+//    mid2CarFlowCount.map{
+//      case(mid,count) =>
+//        TopNMonitorFlowCount(1,mid,count)
+//    }.toDF().write
+//      .format("jdbc")
+//      .option("url","jdbc:mysql://hdp101:3306/traffic")
+//      .option("user","root")
+//      .option("password","111111")
+//      .option("dbtable","topn_monitor_car_count")
+//      .mode(SaveMode.Append)
+//      .save()
+
+
+    mid2CarFlowCount
+
+  }
+
+
+
 
   def getFinalDate(groupByCameraInfo: RDD[(String, Iterable[MonitorCameraInfo])], groupByMonitorFlow: RDD[(String, Iterable[MonitorFlowAction])],
                    myAccumulatorV: MyAccumulatorV2,spark: SparkSession) = {
