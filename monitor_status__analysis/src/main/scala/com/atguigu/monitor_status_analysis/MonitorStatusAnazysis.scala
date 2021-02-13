@@ -4,30 +4,14 @@ import java.sql.{Connection, PreparedStatement, ResultSet}
 import java.util
 
 import com.alibaba.fastjson.{JSON, JSONObject}
-import com.atguigu.monitor_status_analysis.bean.{MonitorCameraInfo, MonitorFlowAction}
+import com.atguigu.monitor_status_analysis.bean._
 import com.atguigu.monitor_status_analysis.jdbc.JDBCHelper
 import com.atguigu.monitor_status_analysis.utils.StringUtils
 import org.apache.spark.SparkConf
-import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{SaveMode, SparkSession}
-import org.apache.spark.util.AccumulatorV2
-
-import scala.collection.mutable
-
-case class TaskParam(startDate:String,endDate:String,topNum:String,areaName:String)
-case class OriginalRDD(flowAction:RDD[MonitorFlowAction],cameraInfo:RDD[MonitorCameraInfo])
-
-case class MysqlMonitotStatus (task_id:Int, task_name:String, create_time:String, start_time:String, finish_time:String,
-                               task_type:String, task_status:String, task_param:String
-                              )
-
-//需求一
-case class MonitorState(taskId:Long,noraml_monitor_count:Long,normal_camera_count:Long,abnormal_monitor_count:Long
-                        ,abnormal_camera_count:Long,abnormal_monitor_camera_infos:String)
-
-//需求二(字段名称对应)：
-case class TopNMonitorFlowCount(task_id:Long,monitor_id:String,carCount:Long)
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import scala.util.Random
 
 
 object MonitorStatusAnazysis {
@@ -58,23 +42,247 @@ object MonitorStatusAnazysis {
 //    val monitorStateRDD: RDD[MonitorState] = getFinalDate(groupByCameraInfo, groupByMonitorFlow, myAccumulatorV,spark)
 
     //需求二: 车流量最多的topN卡扣
-    val topNFlowMonitor: RDD[(String, Int)] = monitorCarFlowCount(spark,flowAction)
+//    val topNFlowMonitor: RDD[(String, Int)] = monitorCarFlowCount(spark,flowAction)
 
     //需求三：topN卡扣下所有车辆详细信息
-    topNMonitorCardetail(spark,topNFlowMonitor,flowAction)
+//    val topNCarInfo: RDD[MonitorFlowAction] = topNMonitorCardetail(spark,topNFlowMonitor,flowAction)
 
+    //需求四：高速通过topN卡扣  每个卡扣速度最快得10辆车
+//    highSpeedMonitor(spark,flowAction)
+
+    //需求五：碰撞分析（区域，卡扣） =》 两区域共同出现的车辆
+//    pengCar(flowAction,"01","02")
+
+
+    //需求六：车辆轨迹 =》 车辆按照时间经过卡扣排序
+    //京C49161	, 0001-->0007-->0004-->0003-->0001-->0008-->0007-->0001-->0007-->0004-->0002-->0004-->0005-->0002-->0005-->0006-->0004-->0003-->0001-->0000-->0000-->0002-->0008-->0005-->0007-->0007-->0000
+    val carsTrack: RDD[(String, String)] = carTrack(spark,flowAction)
+
+    //需求七 随机抽取：小时流量/天流量 * 需要抽取车辆数 =》 每小时抽取的数量
+//    randomExtract(spark,flowAction)
+
+    //需求八：卡扣流量转化率
+    monitoFlowRate(spark,carsTrack)
 
 
 
   }
 
 
-  def topNMonitorCardetail(spark: SparkSession, topNFlowMonitor: RDD[(String, Int)], flowAction: RDD[MonitorFlowAction]): Unit = {
+  def monitoFlowRate(spark: SparkSession, carsTrack: RDD[(String, String)]): Unit = {
 
-    val tuples: Array[(String, Int)] = topNFlowMonitor.take(3)
+    val carsTrackCount: RDD[(String, Int)] = carsTrack.flatMap {
 
-    flowAction.map(x => (x.monitor_id,x)).groupByKey()
+      case (car, trace) =>
 
+        val strings: Array[String] = trace.split("-->")
+        val tuplesCount: Array[(String, Int)] = strings.slice(0, strings.length - 1).zip(strings.tail).map {
+          case (a, b) => a + "_" + b
+        }.map(x => (x, 1))
+
+        tuplesCount
+    }
+
+    carsTrackCount.reduceByKey(_+_).sortBy(_._2,false).foreach(println(_))
+
+  }
+
+
+
+
+  def randomExtract(spark: SparkSession, flowAction: RDD[MonitorFlowAction]): Unit = {
+
+    //output：(06,2732)
+    //reduceByKey(_+_) 按照key 执行 _+_操作
+    val hour2Count: RDD[(String, Int)] = flowAction.map(x =>(x.action_time.substring(11,13),1)).reduceByKey(_+_)
+    val flowCount: Long = flowAction.count()
+
+    //output：(06,4)
+    val hourExtract: RDD[(String, Int)] = hour2Count.map(x => (x._1,((x._2/flowCount.toDouble) * 100).toInt))
+
+    //获取筛选的index [0,n)
+    val extractIndex: RDD[(String, util.ArrayList[Int])] = hour2Count.join(hourExtract).map {
+      case (hour, (cnt, extCnt)) =>
+
+        val ints = new util.ArrayList[Int]()
+        val random = new Random()
+
+        for (i <- 0 until extCnt) {
+          val i: Int = random.nextInt(cnt)
+          if (!ints.contains(i))
+            ints.add(i)
+        }
+
+        (hour, ints)
+    }
+
+
+    val extractRDD: RDD[MonitorFlowAction] = flowAction.map(x => (x.action_time.substring(11, 13), x)).groupByKey().join(extractIndex).flatMap {
+
+      case (hour, (iter, arrayListIndex)) =>
+        var index: Int = 0
+
+        val flowActions = new ArrayBuffer[MonitorFlowAction]()
+
+        for (elem <- iter) {
+          if (arrayListIndex.contains(index)) {
+            flowActions.+=(elem)
+          }
+          index += 1
+        }
+
+        flowActions
+    }
+
+    import spark.implicits._
+    extractRDD.map(
+      x => ExtractRDD("1",x.car,x.action_time,x.action_time)
+    ).toDF().write
+      .format("jdbc")
+      .option("url", "jdbc:mysql://hdp101:3306/traffic")
+      .option("user", "root")
+      .option("password", "111111")
+      .option("dbtable", "random_extract_car")
+      .mode(SaveMode.Append)
+      .save()
+
+  }
+
+
+
+  def carTrack(spark: SparkSession, flowAction: RDD[MonitorFlowAction]) = {
+
+    //思路： （车辆_卡扣，action_time） 排序
+    val carTrace: RDD[(String, String)] = flowAction.map(x => (x.car +"_"+ x.monitor_id,x.action_time)).sortBy(_._2)
+
+    val car2Mid: RDD[(String, String)] = carTrace.map {
+      case (car_mid, actime) =>
+        val strings: Array[String] = car_mid.split("_")
+        val car: String = strings(0)
+        val mid: String = strings(1)
+        (car, mid)
+    }
+
+    val carsTrace: RDD[(String, String)] = car2Mid.groupByKey().map {
+
+      case (car, iter) =>
+
+        val buffer = new StringBuffer("")
+
+        for (elem <- iter) {
+          buffer.append(elem + "-->")
+        }
+
+        (car, buffer.toString.substring(0,buffer.toString.length - 3))
+
+    }
+
+//    import spark.implicits._
+//    carsTrace.map(x => CarTrace("1","2018-11-05",x._1,x._2))
+//      .toDF().write
+//      .format("jdbc")
+//      .option("url", "jdbc:mysql://hdp101:3306/traffic")
+//      .option("user", "root")
+//      .option("password", "111111")
+//      .option("dbtable", "car_track")
+//      .mode(SaveMode.Append)
+//      .save()
+
+    carsTrace
+
+  }
+
+
+  def pengCar(flowAction: RDD[MonitorFlowAction], str: String, str1: String): Unit = {
+    val area01Car: RDD[String] = flowAction.filter(x => x.area_id.equals("01")).map(_.car).distinct()
+    val area02Car: RDD[String] = flowAction.filter(x => x.area_id.equals("02")).map(_.car).distinct()
+
+    //interselction替代join 避免shuffle
+    val pengCars: RDD[String] = area01Car.intersection(area02Car)
+
+    pengCars.foreach(println(_))
+
+    pengCars
+
+
+  }
+
+  def highSpeedMonitor(spark: SparkSession, flowAction: RDD[MonitorFlowAction]): Unit = {
+
+    val monitor2Speed: RDD[(String, String)] = flowAction.map(x => (x.monitor_id, x.speed))
+
+    //获取最后的值排序
+    //output =》 (SortKey(4745,756,1665),0008)
+    val sortKeyspd: RDD[(SortKey, String)] = monitor2Speed.groupByKey().map {
+      case (mid, iter) =>
+
+        var highSpeed = 0L
+        var middleSpeed = 0L
+        var lowSpeed = 0L
+
+        for (elem <- iter) {
+          if (elem.toLong > 90)
+            highSpeed += 1
+          else if (elem.toLong > 60 && elem.toLong <= 90)
+            middleSpeed += 1
+          else
+            lowSpeed += 1
+        }
+
+        val sortKey = new SortKey(highSpeed, middleSpeed, lowSpeed)
+
+        (sortKey, mid)
+
+    }
+
+    //获取高速通过前三卡扣
+    val top3highMonitor: Array[String] = sortKeyspd.sortByKey(false).take(3).map(_._2)
+
+    val top10monitorCars: RDD[TopNMonitorCarSpd] = flowAction.filter(x => top3highMonitor.contains(x.monitor_id)).map(x => (x.monitor_id, x)).groupByKey().flatMap {
+      case (mid, iter) =>
+        val list: List[MonitorFlowAction] = iter.toList.sortBy(_.speed.toLong).reverse.take(10)
+
+        list.map(x => TopNMonitorCarSpd("1", x.date, x.monitor_id, x.camera_id, x.car, x.action_time, x.speed, x.road_id))
+    }
+
+    import spark.implicits._
+    top10monitorCars.toDF().write
+      .format("jdbc")
+      .option("url", "jdbc:mysql://hdp101:3306/traffic")
+      .option("user", "root")
+      .option("password", "111111")
+      .option("dbtable", "top10_speed_detail")
+      .mode(SaveMode.Append)
+      .save()
+
+    top10monitorCars
+
+  }
+
+
+
+
+  def topNMonitorCardetail(spark: SparkSession, topNFlowMonitor: RDD[(String, Int)], flowAction: RDD[MonitorFlowAction]) = {
+
+    val strings: Array[String] = topNFlowMonitor.take(3).map(_._1)
+
+    val topNCarInfos: RDD[MonitorFlowAction] = flowAction.map(x => (x.monitor_id,x)).filter(x => strings.contains(x._1)).map(_._2)
+
+//    import spark.implicits._
+//    topNCarInfos.map{
+//      x =>
+//        TopNCarInfo("1",x.date,x.monitor_id,x.camera_id,x.car,x.action_time,x.speed,x.road_id)
+//    }.toDF().write
+//      .format("jdbc")
+//          .option("url","jdbc:mysql://hdp101:3306/traffic")
+//          .option("user","root")
+//          .option("password","111111")
+//          .option("dbtable","topn_monitor_detail_info")
+//          .mode(SaveMode.Append)
+//          .save()
+
+
+    topNCarInfos
 
   }
 
@@ -160,10 +368,10 @@ object MonitorStatusAnazysis {
         }
     }.count()
 
-//    异常cid数量
+    //异常cid数量
     val errorCidCount: Long = mid2ErrorCids.map(x => (x._2))
       .flatMap(_.split("\\|")).count()
-//    正常cid数量
+    //正常cid数量
     val healthCid: Long = myAccumulatorV.value.size() - errorCidCount
 
 
@@ -233,67 +441,13 @@ object MonitorStatusAnazysis {
 }
 
 
-//使用
-class MyAccumulatorV2 extends AccumulatorV2[String,util.ArrayList[String]] {
-
-  private val strings = new util.ArrayList[String]
-
-  override def isZero: Boolean = strings.isEmpty
-
-  override def copy(): AccumulatorV2[String, util.ArrayList[String]] = new MyAccumulatorV2
-
-  override def reset(): Unit = strings.clear()
-
-  override def add(v: String): Unit = strings.add(v)
-
-  override def merge(other: AccumulatorV2[String, util.ArrayList[String]]): Unit = strings addAll(other.value)
-
-  override def value: util.ArrayList[String] = strings
-}
 
 
 
-//待续写
-class ErrorMyAccumulatorV2 extends AccumulatorV2[String,Long] {
-
-  var countt = 0L
-
-  override def isZero: Boolean = countt == 0
-
-  override def copy(): AccumulatorV2[String, Long] = new ErrorMyAccumulatorV2
-
-  override def reset(): Unit = countt = 0
-
-  override def add(v: String): Unit = countt += 1
-
-  override def merge(other: AccumulatorV2[String, Long]): Unit = {
-    countt + other.value
-  }
-
-  override def value: Long = countt
-}
 
 
 
-class WdAccumulatorV2 extends AccumulatorV2[String,util.ArrayList[String]]{
 
-  //确定返回结果，最终值
-  val arrayList = new util.ArrayList[String]()
 
-  override def isZero: Boolean = arrayList.isEmpty
 
-  override def copy(): AccumulatorV2[String, util.ArrayList[String]] = new WdAccumulatorV2
 
-  override def reset(): Unit = arrayList.clear()
-
-  override def add(v: String): Unit = {
-    if (v.contains("c"))
-      arrayList.add(v)
-  }
-
-  override def merge(other: AccumulatorV2[String, util.ArrayList[String]]): Unit = {
-    arrayList.addAll(other.value)
-  }
-
-  override def value: util.ArrayList[String] = arrayList
-}
