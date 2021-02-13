@@ -10,12 +10,13 @@ import com.atguigu.monitor_status_analysis.utils.StringUtils
 import org.apache.spark.SparkConf
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{SaveMode, SparkSession}
-import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import org.apache.spark.util.LongAccumulator
+
+import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 
 
 object MonitorStatusAnazysis {
-
 
 
   def main(args: Array[String]): Unit = {
@@ -31,6 +32,7 @@ object MonitorStatusAnazysis {
     //sparkContext 注册累加器
     val myAccumulatorV = new MyAccumulatorV2
     spark.sparkContext.register(myAccumulatorV)
+    val accumulator: LongAccumulator = spark.sparkContext.longAccumulator
 
     //cameraInfo 按照monitor分组，所有camera拿出来拼接，做contain判断
     // (0005,"33745,33745,33745,33745")
@@ -39,7 +41,7 @@ object MonitorStatusAnazysis {
     val groupByMonitorFlow: RDD[(String, Iterable[MonitorFlowAction])] = flowAction.map(x => (x.monitor_id, x)).groupByKey()
 
     //需求一： 0	9	47073	60	0000:37990,60679,75084,51053,34497,03604,93447,07714~~~xxx
-//    val monitorStateRDD: RDD[MonitorState] = getFinalDate(groupByCameraInfo, groupByMonitorFlow, myAccumulatorV,spark)
+    val monitorStateRDD: RDD[MonitorState] = getFinalDate(groupByCameraInfo, groupByMonitorFlow, accumulator,spark)
 
     //需求二: 车流量最多的topN卡扣
 //    val topNFlowMonitor: RDD[(String, Int)] = monitorCarFlowCount(spark,flowAction)
@@ -56,17 +58,108 @@ object MonitorStatusAnazysis {
 
     //需求六：车辆轨迹 =》 车辆按照时间经过卡扣排序
     //京C49161	, 0001-->0007-->0004-->0003-->0001-->0008-->0007-->0001-->0007-->0004-->0002-->0004-->0005-->0002-->0005-->0006-->0004-->0003-->0001-->0000-->0000-->0002-->0008-->0005-->0007-->0007-->0000
-    val carsTrack: RDD[(String, String)] = carTrack(spark,flowAction)
+//    val carsTrack: RDD[(String, String)] = carTrack(spark,flowAction)
 
     //需求七 随机抽取：小时流量/天流量 * 需要抽取车辆数 =》 每小时抽取的数量
 //    randomExtract(spark,flowAction)
 
     //需求八：卡扣流量转化率
-    monitoFlowRate(spark,carsTrack)
+//    monitoFlowRate(spark,carsTrack)
 
 
 
   }
+
+
+  def getFinalDate(groupByCameraInfo: RDD[(String, Iterable[MonitorCameraInfo])], groupByMonitorFlow: RDD[(String, Iterable[MonitorFlowAction])],
+                   longaccu: LongAccumulator, spark: SparkSession): RDD[MonitorState] = {
+
+
+    //获取实际mid2cid(0005,33745|33745|33745|33745)
+    val ActionFloMid2Cid: RDD[(String, String)] = groupByMonitorFlow.map {
+
+      case (mid, iter) =>
+
+        val buffer = new StringBuffer("")
+
+        for (elem <- iter) {
+          buffer.append(elem.camera_id).append(",")
+        }
+
+        val str: String = StringUtils.trimComma(buffer.toString).replaceAll(",", "\\|")
+
+        (mid, str)
+
+    }
+
+    //拿出异常的 (mid，cid1|cid2)
+    //逻辑=》拼接实际mid2cid 判断包不包含实际的每一个cid
+    //output：(0004,50934|21038|30782|90551|28599|88785|81632)
+    val mid2ErrorCids: RDD[(String, String)] = ActionFloMid2Cid.join(groupByCameraInfo).map {
+
+      case (mid, (actualCid, iter)) =>
+
+        val buffer = new StringBuffer("")
+
+        for (elem <- iter) {
+          if (!actualCid.contains(elem.camera_id)) {
+            buffer.append(elem.camera_id).append(",")
+          }
+        }
+
+        val str: String = StringUtils.trimComma(buffer.toString).replaceAll(",", "\\|")
+        (mid, str)
+
+    }
+
+
+    //获取所有mid数量
+    val allMid: Long = groupByCameraInfo.count()
+    //异常mid数量
+    val errorMidCount: Long = mid2ErrorCids.count()
+    //正常mid数量
+    val healthMid: Long = allMid - errorMidCount
+
+    //获取所有cid数量
+    groupByCameraInfo.map {
+      case (mid, cids) =>
+        for (elem <- cids) {
+          longaccu.add(1L)
+        }
+    }.count()
+
+    //异常cid数量
+    val errorCidCount: Long = mid2ErrorCids.map(x => (x._2))
+      .flatMap(_.split("\\|")).count()
+    //正常cid数量
+    val healthCid: Long = longaccu.value - errorCidCount
+
+
+    //rdd转list用collect
+    val allinfo: String = mid2ErrorCids.map {
+      case (a, b) =>
+        a + ":" + b
+    }.collect().mkString("~~~~")
+
+    val monitorStateRDD: RDD[MonitorState] = spark.sparkContext.makeRDD(List(MonitorState(1, healthMid, healthCid, errorMidCount, errorCidCount, allinfo)))
+
+//    import spark.implicits._
+//    monitorStateRDD.toDF().write
+//      .format("jdbc")
+//      .option("url", "jdbc:mysql://hdp101:3306/traffic")
+//      .option("user", "root")
+//      .option("password", "111111")
+//      .option("dbtable", "monitor_state")
+//      .mode(SaveMode.Append)
+//      .save()
+
+    monitorStateRDD.foreach(println(_))
+
+    monitorStateRDD
+
+  }
+
+
 
 
   def monitoFlowRate(spark: SparkSession, carsTrack: RDD[(String, String)]): Unit = {
@@ -90,7 +183,7 @@ object MonitorStatusAnazysis {
 
 
 
-  def randomExtract(spark: SparkSession, flowAction: RDD[MonitorFlowAction]): Unit = {
+  def randomExtract(spark: SparkSession, flowAction: RDD[MonitorFlowAction]) = {
 
     //output：(06,2732)
     //reduceByKey(_+_) 按照key 执行 _+_操作
@@ -204,7 +297,6 @@ object MonitorStatusAnazysis {
 
     pengCars
 
-
   }
 
   def highSpeedMonitor(spark: SparkSession, flowAction: RDD[MonitorFlowAction]): Unit = {
@@ -308,95 +400,6 @@ object MonitorStatusAnazysis {
     mid2CarFlowCount
 
   }
-
-
-
-
-  def getFinalDate(groupByCameraInfo: RDD[(String, Iterable[MonitorCameraInfo])], groupByMonitorFlow: RDD[(String, Iterable[MonitorFlowAction])],
-                   myAccumulatorV: MyAccumulatorV2,spark: SparkSession) = {
-
-    //获取实际mid2cid(0005,33745|33745|33745|33745)
-    val ActionFloMid2Cid: RDD[(String, String)] = groupByMonitorFlow.map {
-
-      case (mid, iter) =>
-
-        val buffer = new StringBuffer("")
-
-        for (elem <- iter) {
-          buffer.append(elem.camera_id).append(",")
-        }
-
-        val str: String = StringUtils.trimComma(buffer.toString).replaceAll(",", "\\|")
-
-        (mid, str)
-
-    }
-
-    //拿出异常的 (mid，cid1|cid2)
-    //逻辑=》拼接实际mid2cid 判断包不包含实际的每一个cid
-    //output：(0004,50934|21038|30782|90551|28599|88785|81632)
-    val mid2ErrorCids: RDD[(String, String)] = ActionFloMid2Cid.join(groupByCameraInfo).map {
-
-      case (mid, (actualCid, iter)) =>
-
-        val buffer = new StringBuffer("")
-
-        for (elem <- iter) {
-          if (!actualCid.contains(elem.camera_id)) {
-            buffer.append(elem.camera_id).append(",")
-          }
-        }
-
-        val str: String = StringUtils.trimComma(buffer.toString).replaceAll(",", "\\|")
-        (mid, str)
-
-    }
-
-
-    //获取所有mid数量
-    val allMid: Long = groupByCameraInfo.count()
-    //异常mid数量
-    val errorMidCount: Long = mid2ErrorCids.count()
-    //正常mid数量
-    val healthMid: Long = allMid - errorMidCount
-
-    //获取所有cid数量
-    groupByCameraInfo.map {
-      case (mid, cids) =>
-        for (elem <- cids) {
-          myAccumulatorV.add(elem.toString)
-        }
-    }.count()
-
-    //异常cid数量
-    val errorCidCount: Long = mid2ErrorCids.map(x => (x._2))
-      .flatMap(_.split("\\|")).count()
-    //正常cid数量
-    val healthCid: Long = myAccumulatorV.value.size() - errorCidCount
-
-
-    //rdd转list用collect
-    val allinfo: String = mid2ErrorCids.map {
-      case (a, b) =>
-        a + ":" + b
-    }.collect().mkString("~~~~")
-
-    val monitorStateRDD: RDD[MonitorState] = spark.sparkContext.makeRDD(List(MonitorState(1, healthMid, healthCid, errorMidCount, errorCidCount, allinfo)))
-
-    import spark.implicits._
-    monitorStateRDD.toDF().write
-      .format("jdbc")
-      .option("url","jdbc:mysql://hdp101:3306/traffic")
-      .option("user","root")
-      .option("password","111111")
-      .option("dbtable","monitor_state")
-      .mode(SaveMode.Append)
-      .save()
-
-    monitorStateRDD
-
-  }
-
 
 
   //获取原始RDD

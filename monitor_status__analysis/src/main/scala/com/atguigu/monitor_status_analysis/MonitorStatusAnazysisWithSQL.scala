@@ -1,8 +1,6 @@
 package com.atguigu.monitor_status_analysis
 
-import com.atguigu.monitor_status_analysis.bean.{MonitorCameraInfo, MonitorFlowAction}
 import org.apache.spark.SparkConf
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 
 
@@ -29,9 +27,6 @@ object MonitorStatusAnazysisWithSQL {
         |(select area_id,road_id,count(*) cnt from monitor_flow_action group by area_id,road_id) tt
         |) t2 where t2.rk <= 3
       """.stripMargin
-
-    spark.sql(sql2).show()
-
 
 
 //    spark.sql(
@@ -67,5 +62,7 @@ object MonitorStatusAnazysisWithSQL {
 //        |tt
 //        |group by tt.mm
 //      """.stripMargin).show()
+
+
   }
 }
